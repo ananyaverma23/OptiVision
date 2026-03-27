@@ -1,0 +1,83 @@
+const router = require('express').Router();
+const prisma = require('../utils/prisma');
+const { authenticate, requireAdmin } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.get('/', async (req, res, next) => {
+  try {
+    const { search, brand, shape, color, gender, lowStock, page = 1, limit = 20, minPrice, maxPrice } = req.query;
+    const skip = (Number(page) - 1) * Number(limit);
+    const where = {
+      storeId: req.storeId, isActive: true,
+      ...(search && { OR: [{ brand: { contains: search, mode: 'insensitive' } }, { model: { contains: search, mode: 'insensitive' } }, { frameCode: { contains: search, mode: 'insensitive' } }, { barcode: { contains: search } }] }),
+      ...(brand && { brand: { equals: brand, mode: 'insensitive' } }),
+      ...(shape && { shape }),
+      ...(color && { color: { contains: color, mode: 'insensitive' } }),
+      ...(gender && { gender: { equals: gender, mode: 'insensitive' } }),
+      ...(minPrice && { sellingPrice: { gte: Number(minPrice) } }),
+      ...(maxPrice && { sellingPrice: { ...(minPrice ? { gte: Number(minPrice) } : {}), lte: Number(maxPrice) } }),
+    };
+    const [frames, total, brands] = await Promise.all([
+      prisma.frame.findMany({ where, skip, take: Number(limit), orderBy: { createdAt: 'desc' } }),
+      prisma.frame.count({ where }),
+      prisma.frame.findMany({ where: { storeId: req.storeId, isActive: true }, distinct: ['brand'], select: { brand: true }, orderBy: { brand: 'asc' } })
+    ]);
+    res.json({ success: true, data: frames, pagination: { page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / Number(limit)) }, filters: { brands: brands.map(b => b.brand) } });
+  } catch (e) { next(e); }
+});
+
+router.get('/barcode/:barcode', async (req, res, next) => {
+  try {
+    const frame = await prisma.frame.findFirst({ where: { barcode: req.params.barcode, storeId: req.storeId, isActive: true } });
+    if (!frame) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, data: frame });
+  } catch (e) { next(e); }
+});
+
+router.get('/low-stock', async (req, res, next) => {
+  try {
+    const frames = await prisma.$queryRaw`SELECT id, brand, model, frame_code, stock_qty, low_stock_alert, selling_price FROM frames WHERE store_id = ${req.storeId}::uuid AND is_active = true AND stock_qty <= low_stock_alert ORDER BY stock_qty ASC LIMIT 20`;
+    res.json({ success: true, data: frames });
+  } catch (e) { next(e); }
+});
+
+router.get('/:id', async (req, res, next) => {
+  try {
+    const frame = await prisma.frame.findFirst({ where: { id: req.params.id, storeId: req.storeId }, include: { supplier: { select: { id: true, name: true } }, stockLogs: { take: 10, orderBy: { createdAt: 'desc' } } } });
+    if (!frame) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, data: frame });
+  } catch (e) { next(e); }
+});
+
+router.post('/', async (req, res, next) => {
+  try {
+    const { brand, model, shape, size, color, material, gender, purchasePrice, sellingPrice, stockQty, lowStockAlert, barcode, imageUrl, supplierId, frameCode } = req.body;
+    if (!brand || !sellingPrice) return res.status(400).json({ success: false, message: 'brand and sellingPrice required' });
+    const code = frameCode || `FRM-${Date.now()}`;
+    const frame = await prisma.frame.create({
+      data: { storeId: req.storeId, frameCode: code, brand, model, shape: shape || 'RECTANGLE', size, color, material, gender, purchasePrice: Number(purchasePrice) || 0, sellingPrice: Number(sellingPrice), stockQty: Number(stockQty) || 0, lowStockAlert: Number(lowStockAlert) || 5, barcode, imageUrl, supplierId }
+    });
+    if (Number(stockQty) > 0) {
+      await prisma.stockMovement.create({ data: { storeId: req.storeId, frameId: frame.id, type: 'IN', quantity: Number(stockQty), beforeQty: 0, afterQty: Number(stockQty), reason: 'Initial stock' } });
+    }
+    res.status(201).json({ success: true, data: frame });
+  } catch (e) { next(e); }
+});
+
+router.put('/:id', async (req, res, next) => {
+  try {
+    const r = await prisma.frame.updateMany({ where: { id: req.params.id, storeId: req.storeId }, data: { ...req.body } });
+    if (!r.count) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, data: await prisma.frame.findUnique({ where: { id: req.params.id } }) });
+  } catch (e) { next(e); }
+});
+
+router.delete('/:id', requireAdmin, async (req, res, next) => {
+  try {
+    await prisma.frame.updateMany({ where: { id: req.params.id, storeId: req.storeId }, data: { isActive: false } });
+    res.json({ success: true });
+  } catch (e) { next(e); }
+});
+
+module.exports = router;
